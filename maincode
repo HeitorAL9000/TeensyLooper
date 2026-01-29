@@ -1,0 +1,550 @@
+#include <Arduino.h>
+#include <Audio.h>
+#include <Wire.h>
+#include <SPI.h>
+
+// ================== Pins ==================
+#define REC_PIN       2
+#define MODE_PIN      3     // LOW = reverse
+#define LOOP_PIN      4     // LOW = loop
+#define KILL_PIN      5
+
+#define TRIG_REC_PIN  6     // Eurorack gate (after divider): HIGH=record, LOW=release/play
+#define TRIG_KILL_PIN 7     // Eurorack trig (after divider): rising edge = kill
+
+#define FREEZE_PIN    8     // toggle to GND = freeze ON
+#define TAPE_PIN      9     // momentary to GND = tape-stop (during playback)
+
+#define LED_PIN       13
+
+// Analog controls (0..3.3V)
+#define POT_WET_PIN   A1
+#define POT_SIZE_PIN  A2
+#define CV_WET_PIN    A3
+#define CV_SIZE_PIN   A4
+
+// ================== Audio buffer settings ==================
+#define SAMPLE_RATE    44100
+#define MAX_SECONDS    4
+#define BUFFER_SIZE    (SAMPLE_RATE * MAX_SECONDS)   // 176,400 samples
+
+#define MIN_PRESS_MS   20
+#define MIN_SAMPLES    ((SAMPLE_RATE * MIN_PRESS_MS) / 1000)
+
+#define FADE_SAMPLES   (SAMPLE_RATE / 100)           // 10 ms
+
+// Pitch drift (subtle tape wobble)
+static constexpr float DRIFT_DEPTH = 0.0035f;         // ~0.35%
+static constexpr float DRIFT_HZ    = 0.35f;
+
+// Tape stop
+static constexpr uint32_t TAPE_STOP_MS = 500;
+static constexpr uint32_t TAPE_STOP_SAMPLES = (SAMPLE_RATE * TAPE_STOP_MS) / 1000;
+
+// Freeze feedback gain (careful: too high can self-oscillate)
+static constexpr float FREEZE_FB_GAIN = 0.985f;
+
+// Output safety
+static constexpr float OUT_GAIN = 0.90f;              // headroom before soft clip
+
+// Put big buffer in DMA-capable RAM region
+DMAMEM int16_t recBuf[BUFFER_SIZE];
+
+// ================== Globals shared with loop() ==================
+volatile bool g_reverseSelected = false;
+volatile bool g_loopSelected    = false;
+volatile bool g_freezeSelected  = false;
+
+volatile bool reqStartRec   = false;
+volatile bool reqStopToPlay = false;
+volatile bool reqKill       = false;
+volatile bool reqTapeStop   = false;
+
+// For LED/UI feedback
+volatile bool     g_isRecording = false;
+volatile bool     g_isPlaying   = false;
+volatile uint32_t g_takeSamples = 0;
+
+// Debounce (buttons)
+elapsedMillis dbRec, dbKill, dbTape;
+bool lastRec  = true;
+bool lastKill = true;
+bool lastTape = true;
+
+// Trigger lockout
+volatile uint32_t trigRecLastUs  = 0;
+volatile uint32_t trigKillLastUs = 0;
+static constexpr uint32_t TRIG_LOCKOUT_US = 5000;
+
+// Knob smoothing
+static float wetSm  = 0.25f;
+static float sizeSm = 0.35f;
+elapsedMillis knobTimer;
+
+// LED timing
+elapsedMillis ledTimer;
+bool ledState = false;
+
+// ================== Helpers ==================
+static inline float clamp01(float x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
+
+static inline float smooth01(float prev, float x, float alpha) {
+  return prev + alpha * (x - prev);
+}
+
+// Simple fast soft clipper (prevents ugly digital clipping)
+// x in [-1,1] approximately; returns [-1,1]
+static inline float softclip(float x) {
+  float ax = fabsf(x);
+  return x / (1.0f + ax);
+}
+
+// ================== Mode + custom AudioStream ==================
+enum Mode : uint8_t { MODE_LIVE=0, MODE_RECORDING, MODE_PLAYBACK };
+enum FadeState : uint8_t { FADE_NONE=0, FADE_TO_PLAY, FADE_TO_LIVE };
+
+class RollingRecPlay : public AudioStream {
+public:
+  RollingRecPlay() : AudioStream(1, inputQueueArray) {}
+
+  // Called in audio thread
+  void startRecording() {
+    mode = MODE_RECORDING;
+
+    // rolling record
+    writeIndex = 0;
+    recLen = 0;
+    wrapped = false;
+
+    // cancel playback
+    playRemaining = 0;
+    fadeState = FADE_NONE;
+    fadeCount = 0;
+
+    tapeActive = false;
+    tapePos = 0;
+
+    g_isRecording = true;
+    g_isPlaying = false;
+    digitalWriteFast(LED_PIN, LOW);
+  }
+
+  void killPlaybackToLive() {
+    mode = MODE_LIVE;
+    fadeState = FADE_TO_LIVE;
+    fadeCount = FADE_SAMPLES;
+    playRemaining = 0;
+
+    tapeActive = false;
+    tapePos = 0;
+
+    g_isRecording = false;
+    g_isPlaying = false;
+    digitalWriteFast(LED_PIN, LOW);
+  }
+
+  void stopRecordingAndStartPlayback(bool doReverse, bool doLoop) {
+    g_isRecording = false;
+
+    if (recLen < MIN_SAMPLES) {
+      mode = MODE_LIVE;
+      fadeState = FADE_TO_LIVE;
+      fadeCount = FADE_SAMPLES;
+      g_isPlaying = false;
+      digitalWriteFast(LED_PIN, LOW);
+      return;
+    }
+
+    reverse = doReverse;
+    loopPlayback = doLoop;
+
+    playLen = recLen;
+    playStart = wrapped ? writeIndex : 0;
+
+    // fractional read for pitch drift / tape-stop
+    if (!reverse) {
+      readPos = (float)playStart;
+    } else {
+      uint32_t last = (playStart + playLen - 1) % BUFFER_SIZE;
+      readPos = (float)last;
+    }
+
+    playRemaining = playLen;
+    mode = MODE_PLAYBACK;
+
+    // reset drift LFO and tape-stop
+    driftPhase = 0.0f;
+    tapeActive = false;
+    tapePos = 0;
+
+    fadeState = FADE_TO_PLAY;
+    fadeCount = FADE_SAMPLES;
+
+    g_isPlaying = true;
+    g_takeSamples = playLen;
+    digitalWriteFast(LED_PIN, HIGH);
+  }
+
+  void requestTapeStop() {
+    if (mode == MODE_PLAYBACK && !tapeActive) {
+      tapeActive = true;
+      tapePos = 0;
+    }
+  }
+
+  virtual void update(void) override {
+    audio_block_t *inBlock = receiveReadOnly(0);
+    if (!inBlock) return;
+
+    audio_block_t *outBlock = allocate();
+    if (!outBlock) {
+      release(inBlock);
+      return;
+    }
+
+    // Handle requests in audio thread
+    if (reqKill) {
+      reqKill = false;
+      killPlaybackToLive();
+    }
+    if (reqStartRec) {
+      reqStartRec = false;
+      startRecording();
+    }
+    if (reqStopToPlay) {
+      reqStopToPlay = false;
+      stopRecordingAndStartPlayback(g_reverseSelected, g_loopSelected);
+    }
+    if (reqTapeStop) {
+      reqTapeStop = false;
+      requestTapeStop();
+    }
+
+    for (int i = 0; i < AUDIO_BLOCK_SAMPLES; i++) {
+      int16_t in = inBlock->data[i];
+      int16_t liveOut = in;
+
+      if (mode == MODE_RECORDING) {
+        recBuf[writeIndex] = in;
+        writeIndex++;
+        if (writeIndex >= BUFFER_SIZE) { writeIndex = 0; wrapped = true; }
+        if (recLen < BUFFER_SIZE) recLen++;
+        else wrapped = true;
+
+        outBlock->data[i] = liveOut;
+        continue;
+      }
+
+      // Playback sample
+      bool playingNow = (mode == MODE_PLAYBACK && playRemaining > 0);
+      int16_t playOut = 0;
+
+      if (playingNow) {
+        // Read with nearest-neighbor from fractional position
+        uint32_t idx = (uint32_t)readPos;
+        if (idx >= BUFFER_SIZE) idx %= BUFFER_SIZE;
+        playOut = recBuf[idx];
+
+        // drift LFO
+        driftPhase += (2.0f * 3.14159265f * DRIFT_HZ) / (float)SAMPLE_RATE;
+        if (driftPhase > 2.0f * 3.14159265f) driftPhase -= 2.0f * 3.14159265f;
+        float drift = 1.0f + DRIFT_DEPTH * sinf(driftPhase);
+
+        // tape-stop ramp
+        float tapeMul = 1.0f;
+        if (tapeActive) {
+          if (tapePos < TAPE_STOP_SAMPLES) {
+            tapeMul = 1.0f - (float)tapePos / (float)TAPE_STOP_SAMPLES; // 1 -> 0
+            tapePos++;
+          } else {
+            // stop
+            killPlaybackToLive();
+            playingNow = false;
+            playOut = 0;
+            tapeMul = 0.0f;
+          }
+        }
+
+        float step = drift * tapeMul;
+
+        // Move fractional read position
+        if (!reverse) {
+          readPos += step;
+          // wrap within the captured window
+          float end = (float)((playStart + playLen) % BUFFER_SIZE);
+          // simpler: just wrap in full buffer space
+          if (readPos >= (float)BUFFER_SIZE) readPos -= (float)BUFFER_SIZE;
+        } else {
+          readPos -= step;
+          if (readPos < 0.0f) readPos += (float)BUFFER_SIZE;
+        }
+
+        // Consume one output sample from the take (so duration stays correct)
+        playRemaining--;
+        if (playRemaining == 0) {
+          if (loopPlayback) {
+            // restart loop
+            if (!reverse) readPos = (float)playStart;
+            else readPos = (float)((playStart + playLen - 1) % BUFFER_SIZE);
+
+            playRemaining = playLen;
+            fadeState = FADE_TO_PLAY;
+            fadeCount = FADE_SAMPLES / 2;
+
+            // reset drift phase each loop if you want tighter timing:
+            // driftPhase = 0.0f;
+          } else {
+            mode = MODE_LIVE;
+            fadeState = FADE_TO_LIVE;
+            fadeCount = FADE_SAMPLES;
+            g_isPlaying = false;
+            digitalWriteFast(LED_PIN, LOW);
+          }
+        }
+      }
+
+      // Click-free fades between live and playback
+      int16_t out = liveOut;
+      if (fadeState == FADE_NONE) {
+        out = playingNow ? playOut : liveOut;
+      } else {
+        float t = 1.0f - (float)fadeCount / (float)FADE_SAMPLES;
+        int16_t a = 0, b = 0;
+        if (fadeState == FADE_TO_PLAY) { a = liveOut; b = playingNow ? playOut : 0; }
+        else { a = playingNow ? playOut : 0; b = liveOut; }
+
+        int32_t mix = (int32_t)((1.0f - t) * a + t * b);
+        out = (int16_t)mix;
+
+        if (fadeCount > 0) fadeCount--;
+        if (fadeCount == 0) fadeState = FADE_NONE;
+      }
+
+      outBlock->data[i] = out;
+    }
+
+    transmit(outBlock);
+    release(outBlock);
+    release(inBlock);
+  }
+
+private:
+  audio_block_t *inputQueueArray[1];
+
+  Mode mode = MODE_LIVE;
+
+  // Recording
+  uint32_t writeIndex = 0;
+  uint32_t recLen = 0;
+  bool wrapped = false;
+
+  // Playback
+  bool reverse = false;
+  bool loopPlayback = false;
+  uint32_t playStart = 0;
+  uint32_t playLen = 0;
+  uint32_t playRemaining = 0;
+
+  float readPos = 0.0f;
+
+  // Drift
+  float driftPhase = 0.0f;
+
+  // Tape stop
+  bool tapeActive = false;
+  uint32_t tapePos = 0;
+
+  // Fade
+  FadeState fadeState = FADE_NONE;
+  uint32_t fadeCount = 0;
+};
+
+// ================== Audio graph ==================
+// We build a freeze feedback path:
+//   fx -> fbMix -> freeverb -> wetMix -> limiterOut
+//          ^                 |
+//          |----- (feedback)-|
+
+AudioInputI2S        i2sIn;
+RollingRecPlay       fx;
+
+AudioMixer4          fbMix;       // input0 = fx, input1 = feedback from reverb
+AudioEffectFreeverb  freeverb;
+
+AudioMixer4          outMix;       // input0 = dry (fx), input1 = wet (freeverb)
+AudioOutputI2S       i2sOut;
+
+AudioConnection      pc1(i2sIn, 0, fx, 0);
+AudioConnection      pc2(fx, 0, fbMix, 0);
+AudioConnection      pc3(fbMix, 0, freeverb, 0);
+AudioConnection      pc4(freeverb, 0, fbMix, 1);     // feedback loop
+AudioConnection      pc5(fx, 0, outMix, 0);          // dry
+AudioConnection      pc6(freeverb, 0, outMix, 1);    // wet
+AudioConnection      pc7(outMix, 0, i2sOut, 0);
+
+AudioControlSGTL5000 audioShield;
+
+// ================== Eurorack trigger ISRs ==================
+void IRAM_ATTR isrTrigRecChange() {
+  uint32_t now = micros();
+  if (now - trigRecLastUs < TRIG_LOCKOUT_US) return;
+  trigRecLastUs = now;
+
+  bool level = digitalReadFast(TRIG_REC_PIN);
+  if (level) reqStartRec = true;
+  else       reqStopToPlay = true;
+}
+
+void IRAM_ATTR isrTrigKillRise() {
+  uint32_t now = micros();
+  if (now - trigKillLastUs < TRIG_LOCKOUT_US) return;
+  trigKillLastUs = now;
+
+  reqKill = true;
+}
+
+// ================== Setup ==================
+void setup() {
+  pinMode(REC_PIN,     INPUT_PULLUP);
+  pinMode(MODE_PIN,    INPUT_PULLUP);
+  pinMode(LOOP_PIN,    INPUT_PULLUP);
+  pinMode(KILL_PIN,    INPUT_PULLUP);
+
+  pinMode(TRIG_REC_PIN,  INPUT_PULLUP);
+  pinMode(TRIG_KILL_PIN, INPUT_PULLUP);
+
+  pinMode(FREEZE_PIN,  INPUT_PULLUP);
+  pinMode(TAPE_PIN,    INPUT_PULLUP);
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWriteFast(LED_PIN, LOW);
+
+  attachInterrupt(digitalPinToInterrupt(TRIG_REC_PIN),  isrTrigRecChange, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(TRIG_KILL_PIN), isrTrigKillRise,  RISING);
+
+  analogReadResolution(10);
+
+  AudioMemory(30);
+
+  audioShield.enable();
+  audioShield.inputSelect(AUDIO_INPUT_LINEIN);
+  audioShield.lineInLevel(8);
+  audioShield.volume(0.6);
+
+  // Start with safe mix values
+  outMix.gain(0, 0.85f);   // dry
+  outMix.gain(1, 0.25f);   // wet
+
+  // Feedback mixer defaults (no freeze)
+  fbMix.gain(0, 1.0f);     // input from fx
+  fbMix.gain(1, 0.0f);     // feedback off initially
+
+  // Reverb defaults
+  freeverb.roomsize(0.35f);
+  freeverb.damping(0.35f);
+
+  dbRec = dbKill = dbTape = 0;
+  knobTimer = 0;
+  ledTimer = 0;
+}
+
+// ================== Main loop ==================
+void loop() {
+  // Switches
+  g_reverseSelected = (digitalRead(MODE_PIN) == LOW);
+  g_loopSelected    = (digitalRead(LOOP_PIN) == LOW);
+  g_freezeSelected  = (digitalRead(FREEZE_PIN) == LOW);
+
+  // Buttons debounced
+  bool recNow = digitalRead(REC_PIN);
+  if (recNow != lastRec && dbRec > 15) {
+    dbRec = 0;
+    lastRec = recNow;
+    if (!recNow) reqStartRec = true;
+    else         reqStopToPlay = true;
+  }
+
+  bool killNow = digitalRead(KILL_PIN);
+  if (killNow != lastKill && dbKill > 15) {
+    dbKill = 0;
+    lastKill = killNow;
+    if (!killNow) reqKill = true;
+  }
+
+  bool tapeNow = digitalRead(TAPE_PIN);
+  if (tapeNow != lastTape && dbTape > 15) {
+    dbTape = 0;
+    lastTape = tapeNow;
+    if (!tapeNow) reqTapeStop = true; // press triggers tape stop
+  }
+
+  // Knobs/CV update @ ~50 Hz (avoid zipper noise)
+  if (knobTimer > 20) {
+    knobTimer = 0;
+
+    float potWet  = analogRead(POT_WET_PIN)  / 1023.0f;
+    float potSize = analogRead(POT_SIZE_PIN) / 1023.0f;
+
+    float cvWet   = analogRead(CV_WET_PIN)   / 1023.0f;
+    float cvSize  = analogRead(CV_SIZE_PIN)  / 1023.0f;
+
+    // Combine pot + CV (simple sum, then clamp)
+    float wet01  = clamp01(potWet  + cvWet);
+    float size01 = clamp01(potSize + cvSize);
+
+    // Smooth
+    wetSm  = smooth01(wetSm,  wet01,  0.12f);
+    sizeSm = smooth01(sizeSm, size01, 0.12f);
+
+    // Map to useful ranges
+    float room = 0.10f + 0.85f * sizeSm;     // 0.10..0.95
+    float damp = 0.15f + 0.70f * (1.0f - sizeSm); // bigger room => slightly less damping feel
+
+    // Freeze routing + parameters
+    if (g_freezeSelected) {
+      // cut new input, feed back reverb output into itself
+      fbMix.gain(0, 0.0f);
+      fbMix.gain(1, FREEZE_FB_GAIN);
+      freeverb.roomsize(0.99f);
+      freeverb.damping(0.00f);
+    } else {
+      fbMix.gain(0, 1.0f);
+      fbMix.gain(1, 0.0f);
+      freeverb.roomsize(room);
+      freeverb.damping(damp);
+    }
+
+    // Wet/dry (constant power-ish crossfade with headroom)
+    float wet = wetSm;
+    float dry = 1.0f - wet;
+
+    wet *= 0.90f;
+    dry *= 0.90f;
+
+    outMix.gain(0, dry);
+    outMix.gain(1, wet);
+
+    // LED brightness when not playing: reflect wet amount
+    if (!g_isPlaying) {
+      analogWrite(LED_PIN, (int)(wetSm * 255.0f));
+    }
+  }
+
+  // LED blink during playback: rate shows take length
+  if (g_isPlaying) {
+    // Map take length to blink period (short take = fast blink)
+    uint32_t s = g_takeSamples;
+    if (s < 2000) s = 2000;
+    if (s > (SAMPLE_RATE * MAX_SECONDS)) s = (SAMPLE_RATE * MAX_SECONDS);
+
+    // 0.05s .. 0.8s approx
+    float norm = (float)s / (float)(SAMPLE_RATE * MAX_SECONDS); // 0..1
+    uint32_t periodMs = (uint32_t)(60 + norm * 740);
+
+    if (ledTimer > periodMs) {
+      ledTimer = 0;
+      ledState = !ledState;
+      digitalWriteFast(LED_PIN, ledState ? HIGH : LOW);
+    }
+  }
+}
