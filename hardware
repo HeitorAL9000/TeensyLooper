@@ -1,0 +1,13 @@
+Control	Type	Purpose
+REC	          Momentary pushbutton	Hold to record, release to play
+MODE	        Toggle switch	Forward / Reverse
+LOOP	        Toggle switch	One-shot / Loop
+KILL	        Momentary pushbutton	Stop playback immediately
+LED	          Indicator	Playback active
+
+Pinout:
+#define REC_PIN   2
+#define MODE_PIN  3
+#define LOOP_PIN  4
+#define KILL_PIN  5
+#define LED_PIN   13
